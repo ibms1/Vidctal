@@ -7,14 +7,20 @@ from ultralytics import YOLO
 from segment_anything import sam_model_registry, SamPredictor
 import os
 from pathlib import Path
+from PIL import Image
+import time
 
-# Constants
+# تعريف المسارات والثوابت
 MODEL_PATH = Path("models/sam_vit_h_4b8939.pth")
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
 
 @st.cache_resource
-def load_sam_model():
+def load_models():
+    # تحميل نموذج YOLO
+    yolo_model = YOLO('yolov8n.pt')
+    
+    # تحميل نموذج SAM
     model_type = "vit_h"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -24,158 +30,177 @@ def load_sam_model():
         
     sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
     sam.to(device=device)
-    return sam
-
-@st.cache_resource
-def load_yolo_model():
-    return YOLO('yolov8n.pt')
-
-def get_frame_from_video(video_path, frame_number):
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-    ret, frame = cap.read()
-    cap.release()
-    return frame if ret else None
-
-def process_frame(frame, predictor, point_coords=None, point_labels=None):
-    if point_coords is None or point_labels is None:
-        return None
-    
-    # Get mask from SAM
-    masks, _, _ = predictor.predict(
-        point_coords=point_coords,
-        point_labels=point_labels,
-        multimask_output=False
-    )
-    
-    # Convert mask to uint8
-    mask = masks[0].astype(np.uint8) * 255
-    
-    # Inpainting
-    if np.any(mask):
-        return cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
-    return frame
-
-def process_video(video_path, selected_frame, point_coords, point_labels, progress_text):
-    # Load models
-    sam = load_sam_model()
     predictor = SamPredictor(sam)
     
-    # Read video
+    return yolo_model, predictor
+
+def extract_frames(video_path, frame_dir):
+    """استخراج إطارات الفيديو وحفظها كصور"""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Create output video writer
-    temp_output = str(TEMP_DIR / "output.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Changed from 'avc1' to 'mp4v'
-    out = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+    frames = []
+    progress_bar = st.progress(0)
+    frame_index = 0
     
-    try:
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        progress_bar = st.progress(0)
-        
-        # Process reference frame first
-        ref_frame = get_frame_from_video(video_path, selected_frame)
-        predictor.set_image(ref_frame)
-        ref_mask = process_frame(ref_frame, predictor, point_coords, point_labels)
-        
-        # Process all frames
-        for frame_idx in range(frame_count):
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
             
-            # Update progress
-            progress = (frame_idx + 1) / frame_count
-            progress_bar.progress(progress)
-            progress_text.text(f"Processing frame {frame_idx + 1} of {frame_count}")
-            
-            # Process frame
-            predictor.set_image(frame)
-            processed_frame = process_frame(frame, predictor, point_coords, point_labels)
-            if processed_frame is None:
-                processed_frame = frame
-                
-            out.write(processed_frame)
-            
-    finally:
-        cap.release()
-        out.release()
+        frame_path = frame_dir / f"frame_{frame_index:04d}.jpg"
+        cv2.imwrite(str(frame_path), frame)
+        frames.append(frame_path)
         
-    # Convert output to web-compatible format
-    final_output = str(TEMP_DIR / "final_output.mp4")
-    os.system(f"ffmpeg -i {temp_output} -vcodec libx264 {final_output}")
+        # تحديث شريط التقدم
+        progress = (frame_index + 1) / frame_count
+        progress_bar.progress(progress)
+        frame_index += 1
     
+    cap.release()
+    return frames, fps
+
+def detect_objects(frame_path, yolo_model):
+    """اكتشاف الكائنات في الإطار باستخدام YOLO"""
+    results = yolo_model(str(frame_path))
+    objects = []
+    
+    for r in results:
+        for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+            if conf > 0.5:  # حد الثقة
+                objects.append({
+                    'box': box.cpu().numpy(),
+                    'class': yolo_model.names[int(cls)],
+                    'confidence': float(conf)
+                })
+    
+    return objects
+
+def process_frame(frame_path, selected_objects, predictor, yolo_model):
+    """معالجة إطار واحد وإزالة الكائنات المحددة"""
+    frame = cv2.imread(str(frame_path))
+    predictor.set_image(frame)
+    
+    # اكتشاف الكائنات
+    objects = detect_objects(frame_path, yolo_model)
+    final_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    
+    # إنشاء قناع للكائنات المحددة
+    for obj in objects:
+        if obj['class'] in selected_objects:
+            box = obj['box'].astype(int)
+            masks, _, _ = predictor.predict(
+                box=box,
+                multimask_output=False
+            )
+            final_mask = np.logical_or(final_mask, masks[0]).astype(np.uint8) * 255
+    
+    # إزالة الكائنات المحددة
+    if np.any(final_mask):
+        processed_frame = cv2.inpaint(frame, final_mask, 3, cv2.INPAINT_TELEA)
+        cv2.imwrite(str(frame_path), processed_frame)
+
+def create_video(frame_paths, output_path, fps):
+    """إنشاء فيديو من الإطارات المعالجة"""
+    frame = cv2.imread(str(frame_paths[0]))
+    height, width = frame.shape[:2]
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    for frame_path in frame_paths:
+        frame = cv2.imread(str(frame_path))
+        out.write(frame)
+    
+    out.release()
+    
+    # تحويل الفيديو إلى تنسيق متوافق مع الويب
+    final_output = output_path.parent / "final_output.mp4"
+    os.system(f"ffmpeg -i {output_path} -vcodec libx264 {final_output}")
     return final_output
 
 def main():
     st.title("Video Object Removal App")
-    st.write("Upload a video and click on objects you want to remove")
+    st.write("Upload a video and select objects to remove")
     
-    # Session state for coordinates
-    if 'points' not in st.session_state:
-        st.session_state.points = []
-        st.session_state.labels = []
+    # تحميل النماذج
+    yolo_model, predictor = load_models()
     
-    uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi", "mkv"])
+    uploaded_file = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv"])
     
     if uploaded_file is not None:
-        # Save uploaded video
-        video_path = str(TEMP_DIR / "input.mp4")
+        # إنشاء مجلد مؤقت للإطارات
+        frames_dir = TEMP_DIR / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        
+        # حفظ الفيديو المحمل
+        video_path = TEMP_DIR / "input.mp4"
         with open(video_path, "wb") as f:
             f.write(uploaded_file.read())
+        
+        # عرض الفيديو الأصلي
+        st.video(video_path)
+        
+        # استخراج الإطارات
+        with st.spinner("Extracting frames..."):
+            frames, fps = extract_frames(str(video_path), frames_dir)
+        
+        if frames:
+            # اكتشاف الكائنات في الإطار الأول
+            first_frame = frames[0]
+            objects = detect_objects(first_frame, yolo_model)
             
-        # Get total frames
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        
-        # Frame selection slider
-        frame_number = st.slider("Select frame for object selection", 0, total_frames-1, 0)
-        
-        # Display selected frame
-        frame = get_frame_from_video(video_path, frame_number)
-        if frame is not None:
-            # Convert frame to RGB for display
+            # عرض الإطار الأول مع الكائنات المكتشفة
+            frame = cv2.imread(str(first_frame))
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Create clickable image
-            clicked = st.image(frame_rgb, use_column_width=True)
+            # إنشاء صورة مع إطارات حول الكائنات
+            annotated_frame = frame_rgb.copy()
+            for obj in objects:
+                box = obj['box'].astype(int)
+                cv2.rectangle(annotated_frame, 
+                            (box[0], box[1]), 
+                            (box[2], box[3]), 
+                            (0, 255, 0), 2)
+                cv2.putText(annotated_frame, 
+                          f"{obj['class']} ({obj['confidence']:.2f})",
+                          (box[0], box[1] - 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
-            # Handle click events
-            if st.button("Add Click Point"):
-                # In a real implementation, you would get coordinates from mouse click
-                # For now, we'll use center point as example
-                h, w = frame.shape[:2]
-                st.session_state.points.append([w//2, h//2])
-                st.session_state.labels.append(1)  # 1 for foreground
+            # عرض الإطار المشروح
+            st.image(annotated_frame, caption="Detected Objects", use_column_width=True)
+            
+            # إنشاء قائمة بالكائنات المكتشفة
+            detected_classes = list(set(obj['class'] for obj in objects))
+            selected_objects = st.multiselect(
+                "Select objects to remove",
+                detected_classes
+            )
+            
+            if selected_objects and st.button("Process Video"):
+                progress_text = st.empty()
+                progress_bar = st.progress(0)
                 
-            # Show selected points
-            if st.session_state.points:
-                st.write("Selected points:", st.session_state.points)
+                # معالجة كل إطار
+                for i, frame_path in enumerate(frames):
+                    process_frame(frame_path, selected_objects, predictor, yolo_model)
+                    progress = (i + 1) / len(frames)
+                    progress_bar.progress(progress)
+                    progress_text.text(f"Processing frame {i + 1} of {len(frames)}")
                 
-                if st.button("Clear Points"):
-                    st.session_state.points = []
-                    st.session_state.labels = []
+                # إنشاء الفيديو النهائي
+                with st.spinner("Creating final video..."):
+                    output_path = TEMP_DIR / "output.mp4"
+                    final_output = create_video(frames, output_path, fps)
                 
-                if st.button("Process Video"):
-                    progress_text = st.empty()
-                    with st.spinner("Processing..."):
-                        point_coords = np.array(st.session_state.points)
-                        point_labels = np.array(st.session_state.labels)
-                        
-                        output_path = process_video(
-                            video_path,
-                            frame_number,
-                            point_coords,
-                            point_labels,
-                            progress_text
-                        )
-                        
-                        st.success("Processing complete!")
-                        st.video(output_path)
+                st.success("Processing complete!")
+                st.video(str(final_output))
+                
+                # تنظيف الملفات المؤقتة
+                for frame_path in frames:
+                    os.remove(frame_path)
+                frames_dir.rmdir()
 
 if __name__ == "__main__":
     main()
