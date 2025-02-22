@@ -6,6 +6,7 @@ import torch
 from ultralytics import YOLO
 from segment_anything import sam_model_registry, SamPredictor
 import os
+import requests
 
 @st.cache_resource
 def load_sam_model():
@@ -83,7 +84,46 @@ def process_video(video_path, selected_objects):
         out.release()
         
     return temp_output
+    def download_sam_model():
+        url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+        local_filename = "sam_vit_h_4b8939.pth"
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return local_filename
 
+    def main():
+        st.title("Advanced Video Object Removal App")
+        
+        # Download SAM model if not exists
+        if not os.path.exists("sam_vit_h_4b8939.pth"):
+            st.warning("Downloading SAM model...")
+            download_sam_model()
+            st.success("SAM model downloaded successfully. Please restart the app.")
+            return
+        
+        uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi", "mkv"])
+        if uploaded_file is not None:
+            tfile = tempfile.NamedTemporaryFile(delete=False)
+            tfile.write(uploaded_file.read())
+            video_path = tfile.name
+            
+            st.video(video_path)
+            
+            yolo_model = YOLO('yolov8n.pt')
+            object_names = yolo_model.names
+            selected_objects = st.multiselect("Select objects to remove", object_names)
+            
+            if st.button("Process Video"):
+                with st.spinner("Processing..."):
+                    output_path = process_video(video_path, selected_objects)
+                    st.success("Processing complete!")
+                    st.video(output_path)
+
+    if __name__ == "__main__":
+        main()
 def main():
     st.title("Advanced Video Object Removal App")
     
