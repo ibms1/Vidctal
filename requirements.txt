@@ -2,5 +2,7 @@ streamlit
 opencv-python-headless
 numpy
 torch
+torchvision
 ultralytics
-git+https://github.com/facebookresearch/segment-anything.git
+segment-anything
+requests

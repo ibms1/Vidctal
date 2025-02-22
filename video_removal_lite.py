@@ -6,30 +6,41 @@ import torch
 from ultralytics import YOLO
 from segment_anything import sam_model_registry, SamPredictor
 import os
-import requests
+from pathlib import Path
+
+# تعريف مسار النموذج
+MODEL_PATH = Path("models/sam_vit_h_4b8939.pth")
 
 @st.cache_resource
 def load_sam_model():
-    sam_checkpoint = "sam_vit_h_4b8939.pth"
     model_type = "vit_h"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    
+    if not MODEL_PATH.exists():
+        st.error("نموذج SAM غير موجود. يرجى تحميله أولاً.")
+        st.stop()
+        
+    sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
     sam.to(device=device)
     return sam
 
-def process_video(video_path, selected_objects):
-    # Load models
-    yolo_model = YOLO('yolov8n.pt')
+@st.cache_resource
+def load_yolo_model():
+    return YOLO('yolov8n.pt')
+
+def process_video(video_path, selected_objects, progress_text):
+    # تحميل النماذج
+    yolo_model = load_yolo_model()
     sam = load_sam_model()
     predictor = SamPredictor(sam)
     
-    # Read video
+    # قراءة الفيديو
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Create temporary file for output
+    # إنشاء ملف مؤقت للمخرجات
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
     fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
@@ -43,35 +54,34 @@ def process_video(video_path, selected_objects):
             if not ret:
                 break
             
-            # Update progress
-            progress_bar.progress((frame_idx + 1) / frame_count)
+            # تحديث شريط التقدم
+            progress = (frame_idx + 1) / frame_count
+            progress_bar.progress(progress)
+            progress_text.text(f"معالجة الإطار {frame_idx + 1} من {frame_count}")
             
-            # YOLO detection
+            # YOLO كشف الكائنات باستخدام
             results = yolo_model(frame)
             
-            # Prepare frame for SAM
+            # تحضير الإطار لـ SAM
             predictor.set_image(frame)
             
-            # Create mask for selected objects
+            # إنشاء قناع للكائنات المحددة
             final_mask = np.zeros((height, width), dtype=np.uint8)
             
             for r in results:
                 for box, cls in zip(r.boxes.xyxy, r.boxes.cls):
                     if yolo_model.names[int(cls)] in selected_objects:
-                        # Convert box to input for SAM
                         box = box.cpu().numpy().astype(int)
                         input_box = np.array([box[0], box[1], box[2], box[3]])
                         
-                        # Get SAM mask
                         masks, _, _ = predictor.predict(
                             box=input_box,
                             multimask_output=False
                         )
                         
-                        # Combine masks
                         final_mask = np.logical_or(final_mask, masks[0]).astype(np.uint8) * 255
             
-            # Inpainting with combined mask
+            # معالجة الإطار
             if np.any(final_mask):
                 processed_frame = cv2.inpaint(frame, final_mask, 3, cv2.INPAINT_TELEA)
             else:
@@ -84,55 +94,37 @@ def process_video(video_path, selected_objects):
         out.release()
         
     return temp_output
-    def download_sam_model():
-        url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
-        local_filename = "sam_vit_h_4b8939.pth"
-        with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            with open(local_filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        return local_filename
 
-    def main():
-        st.title("Advanced Video Object Removal App")
-        
-        # Download SAM model if not exists
-        if not os.path.exists("sam_vit_h_4b8939.pth"):
-            st.warning("Downloading SAM model...")
-            download_sam_model()
-            st.success("SAM model downloaded successfully. Please restart the app.")
-            return
-        
-        uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi", "mkv"])
-        if uploaded_file is not None:
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(uploaded_file.read())
-            video_path = tfile.name
-            
-            st.video(video_path)
-            
-            yolo_model = YOLO('yolov8n.pt')
-            object_names = yolo_model.names
-            selected_objects = st.multiselect("Select objects to remove", object_names)
-            
-            if st.button("Process Video"):
-                with st.spinner("Processing..."):
-                    output_path = process_video(video_path, selected_objects)
-                    st.success("Processing complete!")
-                    st.video(output_path)
-
-    if __name__ == "__main__":
-        main()
 def main():
-    st.title("Advanced Video Object Removal App")
+    st.title("تطبيق إزالة الكائنات من الفيديو")
+    st.write("قم بتحميل فيديو وحدد الكائنات التي تريد إزالتها")
     
-    # Download SAM model if not exists
-    if not os.path.exists("sam_vit_h_4b8939.pth"):
-        st.warning("Please download the SAM model first from: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
-        return
+    uploaded_file = st.file_uploader("قم بتحميل ملف فيديو", type=["mp4", "mov", "avi", "mkv"])
     
-    # ...existing code...
+    if uploaded_file is not None:
+        # حفظ الفيديو المحمل
+        tfile = tempfile.NamedTemporaryFile(delete=False)
+        tfile.write(uploaded_file.read())
+        video_path = tfile.name
+        
+        # عرض الفيديو الأصلي
+        st.video(video_path)
+        
+        # تحميل نموذج YOLO وعرض الكائنات المتاحة
+        yolo_model = load_yolo_model()
+        object_names = yolo_model.names
+        selected_objects = st.multiselect("حدد الكائنات المراد إزالتها", object_names)
+        
+        if st.button("معالجة الفيديو"):
+            progress_text = st.empty()
+            with st.spinner("جاري المعالجة..."):
+                output_path = process_video(video_path, selected_objects, progress_text)
+                st.success("اكتملت المعالجة!")
+                st.video(output_path)
+                
+                # تنظيف الملفات المؤقتة
+                os.unlink(tfile.name)
+                os.unlink(output_path)
 
 if __name__ == "__main__":
     main()
