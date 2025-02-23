@@ -7,5 +7,3 @@ ultralytics
 segment-anything
 requests
 ffmpeg-python
-Pillow
-tqdm
