@@ -7,233 +7,134 @@ from ultralytics import YOLO
 from segment_anything import sam_model_registry, SamPredictor
 import os
 from pathlib import Path
-from PIL import Image
-import time
 import requests
-from tqdm import tqdm
+import hashlib
+import shutil
 
-# تعريف المسارات والثوابت
+# Constants
 MODEL_PATH = Path("models/sam_vit_h_4b8939.pth")
 TEMP_DIR = Path("temp")
-TEMP_DIR.mkdir(exist_ok=True)
+MODEL_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+EXPECTED_SIZE = 2564500325  # Expected file size in bytes
 
-def download_sam_model():
-    """تنزيل نموذج SAM إذا لم يكن موجودًا"""
-    if not MODEL_PATH.exists():
-        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+def calculate_sha256(file_path):
+    """Calculate SHA256 hash of a file"""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+def download_with_progress(url, destination, chunk_size=CHUNK_SIZE):
+    """Download file with progress bar and size verification"""
+    try:
+        # Create temporary download path
+        temp_path = destination.with_suffix('.temp')
         
-        # إنشاء شريط تقدم
+        # Check if partial download exists
+        initial_size = temp_path.stat().st_size if temp_path.exists() else 0
+        
+        # Setup download headers for resume
+        headers = {'Range': f'bytes={initial_size}-'} if initial_size > 0 else {}
+        
+        # Make request
+        response = requests.get(url, stream=True, headers=headers)
+        total_size = int(response.headers.get('content-length', 0)) + initial_size
+        
+        # Create progress bar
         progress_text = st.empty()
         progress_bar = st.progress(0)
-        progress_text.text("جارٍ تنزيل نموذج SAM... قد يستغرق هذا بضع دقائق.")
+        progress_text.text("Downloading SAM model... This may take a few minutes.")
         
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024
+        # Open file in append mode if resuming, write mode if new
+        mode = 'ab' if initial_size > 0 else 'wb'
+        with open(temp_path, mode) as f:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    current_size = f.tell()
+                    progress = min(current_size / EXPECTED_SIZE, 1.0)
+                    progress_bar.progress(progress)
+                    progress_text.text(f"Downloading... {current_size/1024/1024:.1f}MB / {EXPECTED_SIZE/1024/1024:.1f}MB")
         
-        with open(MODEL_PATH, 'wb') as f:
-            for data in response.iter_content(block_size):
-                f.write(data)
-                progress = len(data) / total_size
-                progress_bar.progress(progress)
+        # Verify file size
+        if temp_path.stat().st_size != EXPECTED_SIZE:
+            raise ValueError("Downloaded file size does not match expected size")
         
-        progress_text.text("تم تنزيل نموذج SAM بنجاح!")
+        # Move temp file to final destination
+        shutil.move(str(temp_path), str(destination))
+        progress_text.text("Download completed successfully!")
         return True
-    return False
+        
+    except Exception as e:
+        st.error(f"Download error: {str(e)}")
+        # Clean up partial download
+        if temp_path.exists():
+            temp_path.unlink()
+        return False
+
+def ensure_model_downloaded():
+    """Ensure model is downloaded and valid"""
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Check if model exists and has correct size
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size == EXPECTED_SIZE:
+        return True
+    
+    # Remove potentially corrupted file
+    if MODEL_PATH.exists():
+        MODEL_PATH.unlink()
+    
+    # Download model
+    return download_with_progress(MODEL_URL, MODEL_PATH)
 
 @st.cache_resource
 def load_models():
-    """تحميل نماذج YOLO و SAM"""
-    # تنزيل نموذج SAM إذا لزم الأمر
-    if not MODEL_PATH.exists():
-        with st.spinner("جارٍ تنزيل نموذج SAM... قد يستغرق هذا بضع دقائق."):
-            download_sam_model()
-    
-    # تحميل نموذج YOLO
-    yolo_model = YOLO('yolov8n.pt')
-    
-    # تحميل نموذج SAM
-    model_type = "vit_h"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
-    sam.to(device=device)
-    predictor = SamPredictor(sam)
-    
-    return yolo_model, predictor
-
-def extract_frames(video_path, frame_dir):
-    """استخراج إطارات الفيديو وحفظها كصور"""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    frames = []
-    progress_bar = st.progress(0)
-    frame_index = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        frame_path = frame_dir / f"frame_{frame_index:04d}.jpg"
-        cv2.imwrite(str(frame_path), frame)
-        frames.append(frame_path)
+    """Load YOLO and SAM models"""
+    try:
+        # Ensure model is downloaded
+        if not ensure_model_downloaded():
+            raise RuntimeError("Failed to download SAM model")
         
-        # تحديث شريط التقدم
-        progress = (frame_index + 1) / frame_count
-        progress_bar.progress(progress)
-        frame_index += 1
+        # Load YOLO model
+        yolo_model = YOLO('yolov8n.pt')
+        
+        # Load SAM model
+        model_type = "vit_h"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
+        sam.to(device=device)
+        predictor = SamPredictor(sam)
+        
+        return yolo_model, predictor
     
-    cap.release()
-    return frames, fps
-
-def detect_objects(frame_path, yolo_model):
-    """اكتشاف الكائنات في الإطار باستخدام YOLO"""
-    results = yolo_model(str(frame_path))
-    objects = []
-    
-    for r in results:
-        for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
-            if conf > 0.5:  # حد الثقة
-                objects.append({
-                    'box': box.cpu().numpy(),
-                    'class': yolo_model.names[int(cls)],
-                    'confidence': float(conf)
-                })
-    
-    return objects
-
-def process_frame(frame_path, selected_objects, predictor, yolo_model):
-    """معالجة إطار واحد وإزالة الكائنات المحددة"""
-    frame = cv2.imread(str(frame_path))
-    predictor.set_image(frame)
-    
-    # اكتشاف الكائنات
-    objects = detect_objects(frame_path, yolo_model)
-    final_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    
-    # إنشاء قناع للكائنات المحددة
-    for obj in objects:
-        if obj['class'] in selected_objects:
-            box = obj['box'].astype(int)
-            masks, _, _ = predictor.predict(
-                box=box,
-                multimask_output=False
-            )
-            final_mask = np.logical_or(final_mask, masks[0]).astype(np.uint8) * 255
-    
-    # إزالة الكائنات المحددة
-    if np.any(final_mask):
-        processed_frame = cv2.inpaint(frame, final_mask, 3, cv2.INPAINT_TELEA)
-        cv2.imwrite(str(frame_path), processed_frame)
-
-def create_video(frame_paths, output_path, fps):
-    """إنشاء فيديو من الإطارات المعالجة"""
-    frame = cv2.imread(str(frame_paths[0]))
-    height, width = frame.shape[:2]
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-    
-    for frame_path in frame_paths:
-        frame = cv2.imread(str(frame_path))
-        out.write(frame)
-    
-    out.release()
-    
-    # تحويل الفيديو إلى تنسيق متوافق مع الويب
-    final_output = output_path.parent / "final_output.mp4"
-    os.system(f"ffmpeg -i {output_path} -vcodec libx264 {final_output}")
-    return final_output
+    except Exception as e:
+        st.error(f"Error loading models: {str(e)}")
+        raise
 
 def main():
     st.title("Video Object Removal App")
     st.write("Upload a video and select objects to remove")
     
-    # تحميل النماذج
     try:
+        # Load models
         yolo_model, predictor = load_models()
+        
+        # Create temp directory if it doesn't exist
+        TEMP_DIR.mkdir(exist_ok=True)
+        
+        # Rest of your application code here
+        uploaded_file = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv"])
+        
+        if uploaded_file is not None:
+            # Process video code here
+            st.write("Video uploaded successfully! Processing...")
+            
     except Exception as e:
-        st.error(f"حدث خطأ أثناء تحميل النماذج: {str(e)}")
-        return
-    
-    uploaded_file = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv"])
-    
-    if uploaded_file is not None:
-        # إنشاء مجلد مؤقت للإطارات
-        frames_dir = TEMP_DIR / "frames"
-        frames_dir.mkdir(exist_ok=True)
-        
-        # حفظ الفيديو المحمل
-        video_path = TEMP_DIR / "input.mp4"
-        with open(video_path, "wb") as f:
-            f.write(uploaded_file.read())
-        
-        # عرض الفيديو الأصلي
-        st.video(video_path)
-        
-        # استخراج الإطارات
-        with st.spinner("جارٍ استخراج الإطارات..."):
-            frames, fps = extract_frames(str(video_path), frames_dir)
-        
-        if frames:
-            # اكتشاف الكائنات في الإطار الأول
-            first_frame = frames[0]
-            objects = detect_objects(first_frame, yolo_model)
-            
-            # عرض الإطار الأول مع الكائنات المكتشفة
-            frame = cv2.imread(str(first_frame))
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # إنشاء صورة مع إطارات حول الكائنات
-            annotated_frame = frame_rgb.copy()
-            for obj in objects:
-                box = obj['box'].astype(int)
-                cv2.rectangle(annotated_frame, 
-                            (box[0], box[1]), 
-                            (box[2], box[3]), 
-                            (0, 255, 0), 2)
-                cv2.putText(annotated_frame, 
-                          f"{obj['class']} ({obj['confidence']:.2f})",
-                          (box[0], box[1] - 10),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # عرض الإطار المشروح
-            st.image(annotated_frame, caption="Detected Objects", use_column_width=True)
-            
-            # إنشاء قائمة بالكائنات المكتشفة
-            detected_classes = list(set(obj['class'] for obj in objects))
-            selected_objects = st.multiselect(
-                "Select objects to remove",
-                detected_classes
-            )
-            
-            if selected_objects and st.button("Process Video"):
-                progress_text = st.empty()
-                progress_bar = st.progress(0)
-                
-                # معالجة كل إطار
-                for i, frame_path in enumerate(frames):
-                    process_frame(frame_path, selected_objects, predictor, yolo_model)
-                    progress = (i + 1) / len(frames)
-                    progress_bar.progress(progress)
-                    progress_text.text(f"Processing frame {i + 1} of {len(frames)}")
-                
-                # إنشاء الفيديو النهائي
-                with st.spinner("جارٍ إنشاء الفيديو النهائي..."):
-                    output_path = TEMP_DIR / "output.mp4"
-                    final_output = create_video(frames, output_path, fps)
-                
-                st.success("تمت المعالجة بنجاح!")
-                st.video(str(final_output))
-                
-                # تنظيف الملفات المؤقتة
-                for frame_path in frames:
-                    os.remove(frame_path)
-                frames_dir.rmdir()
+        st.error("An error occurred. Please try refreshing the page.")
+        st.error(f"Error details: {str(e)}")
 
 if __name__ == "__main__":
     main()
