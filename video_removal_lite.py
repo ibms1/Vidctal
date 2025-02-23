@@ -12,55 +12,37 @@ import hashlib
 import shutil
 
 # Constants
-MODEL_PATH = Path("models/sam_vit_h_4b8939.pth")
+MODEL_PATH = Path("models/sam_vit_b_01ec64.pth")  # Changed to ViT-B model
 TEMP_DIR = Path("temp")
-MODEL_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+MODEL_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"  # Changed URL
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-EXPECTED_SIZE = 2564500325  # Expected file size in bytes
-
-def calculate_sha256(file_path):
-    """Calculate SHA256 hash of a file"""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+EXPECTED_SIZE = 375001389  # Updated size for ViT-B model
 
 def download_with_progress(url, destination, chunk_size=CHUNK_SIZE):
-    """Download file with progress bar and size verification"""
+    """Download file with progress bar"""
     try:
-        # Create temporary download path
+        # Create parent directory if it doesn't exist
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Setup temporary file
         temp_path = destination.with_suffix('.temp')
         
-        # Check if partial download exists
-        initial_size = temp_path.stat().st_size if temp_path.exists() else 0
+        # Download with progress bar
+        response = requests.get(url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
         
-        # Setup download headers for resume
-        headers = {'Range': f'bytes={initial_size}-'} if initial_size > 0 else {}
-        
-        # Make request
-        response = requests.get(url, stream=True, headers=headers)
-        total_size = int(response.headers.get('content-length', 0)) + initial_size
-        
-        # Create progress bar
         progress_text = st.empty()
         progress_bar = st.progress(0)
-        progress_text.text("Downloading SAM model... This may take a few minutes.")
         
-        # Open file in append mode if resuming, write mode if new
-        mode = 'ab' if initial_size > 0 else 'wb'
-        with open(temp_path, mode) as f:
+        with open(temp_path, 'wb') as f:
+            downloaded_size = 0
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
-                    current_size = f.tell()
-                    progress = min(current_size / EXPECTED_SIZE, 1.0)
+                    downloaded_size += len(chunk)
+                    progress = min(downloaded_size / total_size, 1.0)
                     progress_bar.progress(progress)
-                    progress_text.text(f"Downloading... {current_size/1024/1024:.1f}MB / {EXPECTED_SIZE/1024/1024:.1f}MB")
-        
-        # Verify file size
-        if temp_path.stat().st_size != EXPECTED_SIZE:
-            raise ValueError("Downloaded file size does not match expected size")
+                    progress_text.text(f"Downloading SAM model... {downloaded_size/1024/1024:.1f}MB / {total_size/1024/1024:.1f}MB")
         
         # Move temp file to final destination
         shutil.move(str(temp_path), str(destination))
@@ -69,39 +51,24 @@ def download_with_progress(url, destination, chunk_size=CHUNK_SIZE):
         
     except Exception as e:
         st.error(f"Download error: {str(e)}")
-        # Clean up partial download
         if temp_path.exists():
             temp_path.unlink()
         return False
-
-def ensure_model_downloaded():
-    """Ensure model is downloaded and valid"""
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Check if model exists and has correct size
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size == EXPECTED_SIZE:
-        return True
-    
-    # Remove potentially corrupted file
-    if MODEL_PATH.exists():
-        MODEL_PATH.unlink()
-    
-    # Download model
-    return download_with_progress(MODEL_URL, MODEL_PATH)
 
 @st.cache_resource
 def load_models():
     """Load YOLO and SAM models"""
     try:
-        # Ensure model is downloaded
-        if not ensure_model_downloaded():
-            raise RuntimeError("Failed to download SAM model")
+        # Download model if needed
+        if not MODEL_PATH.exists():
+            if not download_with_progress(MODEL_URL, MODEL_PATH):
+                raise RuntimeError("Failed to download SAM model")
         
         # Load YOLO model
         yolo_model = YOLO('yolov8n.pt')
         
         # Load SAM model
-        model_type = "vit_h"
+        model_type = "vit_b"  # Changed to vit_b
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
         sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
@@ -112,7 +79,72 @@ def load_models():
     
     except Exception as e:
         st.error(f"Error loading models: {str(e)}")
+        # Clean up potentially corrupted file
+        if MODEL_PATH.exists():
+            MODEL_PATH.unlink()
         raise
+
+def process_frame(frame, predictor, selected_objects, yolo_model):
+    """Process a single frame"""
+    results = yolo_model(frame)
+    
+    # Create mask for selected objects
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    predictor.set_image(frame)
+    
+    for r in results:
+        for box, cls in zip(r.boxes.xyxy, r.boxes.cls):
+            if yolo_model.names[int(cls)] in selected_objects:
+                box = box.cpu().numpy().astype(int)
+                input_box = np.array([box[0], box[1], box[2], box[3]])
+                
+                masks, _, _ = predictor.predict(
+                    box=input_box,
+                    multimask_output=False
+                )
+                mask = np.logical_or(mask, masks[0]).astype(np.uint8) * 255
+    
+    # Remove objects using inpainting
+    if np.any(mask):
+        return cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
+    return frame
+
+def process_video(video_path, selected_objects, yolo_model, predictor):
+    """Process video and remove selected objects"""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Create output video writer
+    temp_output = tempfile.NamedTemporaryFile(suffix='.mp4').name
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    out = cv2.VideoWriter(temp_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
+    progress_bar = st.progress(0)
+    frame_text = st.empty()
+    
+    try:
+        for frame_idx in range(total_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Process frame
+            processed_frame = process_frame(frame, predictor, selected_objects, yolo_model)
+            out.write(processed_frame)
+            
+            # Update progress
+            progress = (frame_idx + 1) / total_frames
+            progress_bar.progress(progress)
+            frame_text.text(f"Processing frame {frame_idx + 1} of {total_frames}")
+            
+    finally:
+        cap.release()
+        out.release()
+    
+    return temp_output
 
 def main():
     st.title("Video Object Removal App")
@@ -122,18 +154,50 @@ def main():
         # Load models
         yolo_model, predictor = load_models()
         
-        # Create temp directory if it doesn't exist
-        TEMP_DIR.mkdir(exist_ok=True)
+        # File uploader
+        video_file = st.file_uploader("Choose a video file", type=['mp4', 'avi', 'mov', 'mkv'])
         
-        # Rest of your application code here
-        uploaded_file = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv"])
-        
-        if uploaded_file is not None:
-            # Process video code here
-            st.write("Video uploaded successfully! Processing...")
+        if video_file:
+            # Save uploaded video
+            temp_video = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            temp_video.write(video_file.read())
+            
+            # Show original video
+            st.video(temp_video.name)
+            
+            # Detect objects in first frame
+            cap = cv2.VideoCapture(temp_video.name)
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret:
+                # Get available objects
+                results = yolo_model(frame)
+                detected_objects = []
+                for r in results:
+                    for cls in r.boxes.cls:
+                        obj_name = yolo_model.names[int(cls)]
+                        if obj_name not in detected_objects:
+                            detected_objects.append(obj_name)
+                
+                # Object selection
+                selected_objects = st.multiselect(
+                    "Select objects to remove",
+                    options=detected_objects
+                )
+                
+                if selected_objects and st.button("Process Video"):
+                    with st.spinner("Processing video..."):
+                        output_path = process_video(temp_video.name, selected_objects, yolo_model, predictor)
+                        st.success("Processing complete!")
+                        st.video(output_path)
+                        
+                        # Cleanup
+                        os.unlink(temp_video.name)
+                        os.unlink(output_path)
             
     except Exception as e:
-        st.error("An error occurred. Please try refreshing the page.")
+        st.error("An error occurred. Please try again.")
         st.error(f"Error details: {str(e)}")
 
 if __name__ == "__main__":
