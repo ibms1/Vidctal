@@ -7,3 +7,4 @@ ultralytics
 segment-anything
 requests
 ffmpeg-python
+cv2
