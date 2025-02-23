@@ -9,14 +9,47 @@ import os
 from pathlib import Path
 from PIL import Image
 import time
+import requests
+from tqdm import tqdm
 
 # تعريف المسارات والثوابت
 MODEL_PATH = Path("models/sam_vit_h_4b8939.pth")
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
 
+def download_sam_model():
+    """تنزيل نموذج SAM إذا لم يكن موجودًا"""
+    if not MODEL_PATH.exists():
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+        
+        # إنشاء شريط تقدم
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        progress_text.text("جارٍ تنزيل نموذج SAM... قد يستغرق هذا بضع دقائق.")
+        
+        response = requests.get(url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 1024
+        
+        with open(MODEL_PATH, 'wb') as f:
+            for data in response.iter_content(block_size):
+                f.write(data)
+                progress = len(data) / total_size
+                progress_bar.progress(progress)
+        
+        progress_text.text("تم تنزيل نموذج SAM بنجاح!")
+        return True
+    return False
+
 @st.cache_resource
 def load_models():
+    """تحميل نماذج YOLO و SAM"""
+    # تنزيل نموذج SAM إذا لزم الأمر
+    if not MODEL_PATH.exists():
+        with st.spinner("جارٍ تنزيل نموذج SAM... قد يستغرق هذا بضع دقائق."):
+            download_sam_model()
+    
     # تحميل نموذج YOLO
     yolo_model = YOLO('yolov8n.pt')
     
@@ -24,10 +57,6 @@ def load_models():
     model_type = "vit_h"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    if not MODEL_PATH.exists():
-        st.error("SAM model not found. Please download it first.")
-        st.stop()
-        
     sam = sam_model_registry[model_type](checkpoint=str(MODEL_PATH))
     sam.to(device=device)
     predictor = SamPredictor(sam)
@@ -125,7 +154,11 @@ def main():
     st.write("Upload a video and select objects to remove")
     
     # تحميل النماذج
-    yolo_model, predictor = load_models()
+    try:
+        yolo_model, predictor = load_models()
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء تحميل النماذج: {str(e)}")
+        return
     
     uploaded_file = st.file_uploader("Upload video file", type=["mp4", "mov", "avi", "mkv"])
     
@@ -143,7 +176,7 @@ def main():
         st.video(video_path)
         
         # استخراج الإطارات
-        with st.spinner("Extracting frames..."):
+        with st.spinner("جارٍ استخراج الإطارات..."):
             frames, fps = extract_frames(str(video_path), frames_dir)
         
         if frames:
@@ -190,11 +223,11 @@ def main():
                     progress_text.text(f"Processing frame {i + 1} of {len(frames)}")
                 
                 # إنشاء الفيديو النهائي
-                with st.spinner("Creating final video..."):
+                with st.spinner("جارٍ إنشاء الفيديو النهائي..."):
                     output_path = TEMP_DIR / "output.mp4"
                     final_output = create_video(frames, output_path, fps)
                 
-                st.success("Processing complete!")
+                st.success("تمت المعالجة بنجاح!")
                 st.video(str(final_output))
                 
                 # تنظيف الملفات المؤقتة
