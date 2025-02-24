@@ -25,9 +25,43 @@ MAX_VIDEO_DURATION = 3
 TARGET_FPS = 5
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# Initialize asyncio event loop for Windows
-if platform.system() == 'Windows':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+def download_with_progress(url, destination, chunk_size=CHUNK_SIZE):
+    """Download file with progress bar"""
+    try:
+        # Create parent directory if it doesn't exist
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = destination.with_suffix('.temp')
+        
+        # Make HTTP request
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise exception for bad status codes
+        total_size = int(response.headers.get('content-length', 0))
+        
+        # Set up progress tracking
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        
+        # Download file in chunks
+        with open(temp_path, 'wb') as f:
+            downloaded_size = 0
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    progress = min(downloaded_size / total_size, 1.0)
+                    progress_bar.progress(progress)
+                    progress_text.text(f"تحميل نموذج SAM... {downloaded_size/1024/1024:.1f}MB / {total_size/1024/1024:.1f}MB")
+        
+        # Move temp file to final destination
+        shutil.move(str(temp_path), str(destination))
+        progress_text.text("اكتمل التحميل بنجاح!")
+        return True
+        
+    except Exception as e:
+        st.error(f"خطأ في التحميل: {str(e)}")
+        if temp_path.exists():
+            temp_path.unlink()
+        return False
 
 def init_torch():
     """Initialize PyTorch settings"""
@@ -37,6 +71,27 @@ def init_torch():
     else:
         device = torch.device("cpu")
     return device
+
+def check_video_constraints(video_path):
+    """Check if video meets the required constraints"""
+    cap = cv2.VideoCapture(video_path)
+    
+    # Check duration
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps
+    
+    cap.release()
+    
+    if duration > MAX_VIDEO_DURATION:
+        raise ValueError(f"Video duration ({duration:.1f}s) exceeds maximum allowed duration ({MAX_VIDEO_DURATION}s)")
+    
+    # Check file size
+    file_size = os.path.getsize(video_path)
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(f"File size ({file_size/1024/1024:.1f}MB) exceeds maximum allowed size (50MB)")
+    
+    return fps, total_frames
 
 @st.cache_resource
 def load_models():
@@ -100,6 +155,51 @@ def process_frame(frame, predictor, selected_objects, yolo_model):
         st.error(f"خطأ في معالجة الإطار: {str(e)}")
         return frame
 
+def process_video(video_path, selected_objects, yolo_model, predictor):
+    """Process video with reduced frame rate"""
+    cap = cv2.VideoCapture(video_path)
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Calculate frame sampling
+    frame_interval = max(1, int(original_fps / TARGET_FPS))
+    processed_fps = original_fps / frame_interval
+    
+    # Create temporary output file
+    temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    out = cv2.VideoWriter(temp_output, cv2.VideoWriter_fourcc(*'mp4v'), processed_fps, (width, height))
+    
+    progress_bar = st.progress(0)
+    frame_text = st.empty()
+    
+    try:
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Process only selected frames
+            if frame_count % frame_interval == 0:
+                processed_frame = process_frame(frame, predictor, selected_objects, yolo_model)
+                out.write(processed_frame)
+                
+                # Update progress
+                progress = (frame_count + 1) / total_frames
+                progress_bar.progress(progress)
+                frame_text.text(f"معالجة الإطار {frame_count + 1} من {total_frames}")
+            
+            frame_count += 1
+            
+    finally:
+        cap.release()
+        out.release()
+    
+    return temp_output
+
 def main():
     st.title("تطبيق إزالة الكائنات من الفيديو")
     st.write("قم بتحميل فيديو واختر الكائنات المراد إزالتها")
@@ -120,10 +220,45 @@ def main():
             temp_video.write(video_file.read())
             
             try:
-                # Process video
-                process_video(temp_video.name, predictor, yolo_model)
+                # Check video constraints
+                fps, total_frames = check_video_constraints(temp_video.name)
+                
+                # Show original video
+                st.video(temp_video.name)
+                
+                # Detect objects in first frame
+                cap = cv2.VideoCapture(temp_video.name)
+                ret, frame = cap.read()
+                cap.release()
+                
+                if ret:
+                    results = yolo_model(frame)
+                    detected_objects = []
+                    for r in results:
+                        for cls in r.boxes.cls:
+                            obj_name = yolo_model.names[int(cls)]
+                            if obj_name not in detected_objects:
+                                detected_objects.append(obj_name)
+                    
+                    selected_objects = st.multiselect(
+                        "اختر الكائنات المراد إزالتها",
+                        options=detected_objects
+                    )
+                    
+                    if selected_objects and st.button("معالجة الفيديو"):
+                        with st.spinner("جاري معالجة الفيديو..."):
+                            output_path = process_video(temp_video.name, selected_objects, yolo_model, predictor)
+                            st.success("اكتملت المعالجة!")
+                            st.video(output_path)
+                            
+                            # Cleanup
+                            os.unlink(output_path)
+            
+            except ValueError as e:
+                st.error(str(e))
+            
             finally:
-                # Cleanup
+                # Cleanup temporary video file
                 if os.path.exists(temp_video.name):
                     os.unlink(temp_video.name)
                 
