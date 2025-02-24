@@ -1,9 +1,9 @@
-streamlit==1.31.0
+streamlit
 opencv-python-headless==4.8.0.76
-numpy==1.24.3
-torch==2.1.2
-torchvision==0.16.2
-ultralytics==8.1.2
+numpy
+torch==2.0.0
+torchvision==0.15.0
+ultralytics==8.0.196
 segment-anything==1.0
-requests==2.31.0
-Pillow==10.0.0
+Pillow
+requests
